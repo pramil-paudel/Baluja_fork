@@ -95,7 +95,7 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 # ──────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="Original HidingUNet/RevealNet on RGB or lensless .npy secrets")
 parser.add_argument("--data", default=DEFAULT_DATA_DIR, help="dataset root")
-parser.add_argument("--rgb", default="lensless", choices=["lensless", "rgb"],
+parser.add_argument("--secret_mode", default="rgb", choices=["lensless", "rgb"],
                     help="lensless = use *_secret_lensless/*.npy as secret; rgb = use *_secret images as secret")
 parser.add_argument("--workers", type=int, default=0)
 parser.add_argument("--batchSize", type=int, default=4)
