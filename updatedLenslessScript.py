@@ -5,53 +5,61 @@ main_lensless_npy.py
 ====================
 
 Adapter for the original deep-steganography HidingUNet / RevealNet code,
-but using Pramil's dataset structure where the secret is a precomputed
-lensless diffraction pattern saved as .npy.
+with two secret modes:
+
+1) --secret_mode lensless
+   Secret is a precomputed lensless diffraction pattern saved as .npy.
+
+2) --secret_mode rgb
+   Secret is the normal RGB image from *_secret/class_0/.
 
 Expected dataset structure:
 
 DATA_ROOT/
     train_cover/class_0/
     train_secret_lensless/class_0/
-    train_secret/class_0/                  # optional original RGB secret reference
+    train_secret/class_0/
 
     validation_cover/class_0/
     validation_secret_lensless/class_0/
-    validation_secret/class_0/             # optional original RGB secret reference
+    validation_secret/class_0/
 
     test_cover/class_0/
     test_secret_lensless/class_0/
-    test_secret/class_0/                   # optional original RGB secret reference
+    test_secret/class_0/
 
 Model behavior:
-    cover image          : RGB image tensor [0,1]
-    secret image         : lensless .npy tensor [0,1]
-    Hnet input           : concat(cover, lensless_secret) -> 6 channels
-    Hnet output          : container image [0,1]
-    Rnet input           : container image
-    Rnet output          : recovered lensless secret [0,1]
+    cover image  : RGB image tensor [0,1]
+    secret image : either RGB image [0,1] or lensless .npy tensor [0,1]
+    Hnet input   : concat(cover, secret) -> 6 channels
+    Hnet output  : container image [0,1]
+    Rnet input   : container image
+    Rnet output  : recovered secret [0,1]
 
-This script keeps the original model idea:
-    Hnet = UnetGenerator(input_nc=6, output_nc=3, output_function=nn.Sigmoid)
-    Rnet = RevealNet(output_function=nn.Sigmoid)
-
-but replaces the original MyImageFolder half-batch split with an explicit
-paired cover/lensless-secret dataset.
+Purpose:
+    Run original Baluja-style HidingUNet/RevealNet on both normal RGB secrets
+    and lensless diffraction-pattern secrets. Compare container PSNR and secret
+    PSNR/SSIM curves to show why the original architecture is insufficient for
+    lensless/diffraction secrets and why a lensless-aware architecture is needed.
 """
 
 import argparse
+import csv
 import os
 import shutil
 import socket
 import time
 from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.optim as optim
-import torch.utils.data
 import torchvision.utils as vutils
 from PIL import Image
 from tensorboardX import SummaryWriter
@@ -67,6 +75,13 @@ from models.RevealNet import RevealNet
 # It is used only for qualitative validation/test grids, not for training.
 import lensless.lenslessThree as lenslessConverter
 
+try:
+    from pytorch_msssim import ssim as msssim_ssim
+    SSIM_BACKEND = "pytorch_msssim"
+except Exception:
+    msssim_ssim = None
+    SSIM_BACKEND = "simple"
+
 
 # ──────────────────────────────────────────────────────────
 #  Defaults
@@ -78,8 +93,10 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 # ──────────────────────────────────────────────────────────
 #  Args
 # ──────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description="Original HidingUNet/RevealNet on lensless .npy secrets")
+parser = argparse.ArgumentParser(description="Original HidingUNet/RevealNet on RGB or lensless .npy secrets")
 parser.add_argument("--data", default=DEFAULT_DATA_DIR, help="dataset root")
+parser.add_argument("--rgb", default="lensless", choices=["lensless", "rgb"],
+                    help="lensless = use *_secret_lensless/*.npy as secret; rgb = use *_secret images as secret")
 parser.add_argument("--workers", type=int, default=0)
 parser.add_argument("--batchSize", type=int, default=4)
 parser.add_argument("--imageSize", type=int, default=128, help="cover/secret tensor size")
@@ -93,7 +110,7 @@ parser.add_argument("--Hnet", default="", help="path to HidingNet checkpoint")
 parser.add_argument("--Rnet", default="", help="path to RevealNet checkpoint")
 parser.add_argument("--test_only", action="store_true")
 parser.add_argument("--debug", action="store_true")
-parser.add_argument("--remark", default="_lensless_npy")
+parser.add_argument("--remark", default="", help="extra suffix. If empty, auto uses secret_mode")
 parser.add_argument("--hostname", default=socket.gethostname())
 parser.add_argument("--logFrequency", type=int, default=10)
 parser.add_argument("--resultPicFrequency", type=int, default=100)
@@ -165,7 +182,9 @@ def list_npy_recursive(root):
 
 
 def tensor_to_display_grid(x):
-    """Ensure tensor for save_image is [0,1]."""
+    """Ensure tensor for save_image/matplotlib is [0,1]."""
+    if x is None:
+        return None
     if x.min() < -0.05:
         x = x.clamp(-1, 1).add(1).mul(0.5)
     return x.clamp(0, 1)
@@ -179,24 +198,53 @@ def batch_psnr(pred, target):
     return psnr.mean().item()
 
 
+def batch_ssim(pred, target):
+    pred = pred.clamp(0, 1)
+    target = target.clamp(0, 1)
+
+    if msssim_ssim is not None:
+        try:
+            return float(msssim_ssim(pred, target, data_range=1.0, size_average=True))
+        except Exception:
+            pass
+
+    # Lightweight fallback: not a full MS-SSIM implementation, but stable for trend curves.
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    mu_x = pred.mean(dim=(2, 3), keepdim=True)
+    mu_y = target.mean(dim=(2, 3), keepdim=True)
+    sigma_x = ((pred - mu_x) ** 2).mean(dim=(2, 3), keepdim=True)
+    sigma_y = ((target - mu_y) ** 2).mean(dim=(2, 3), keepdim=True)
+    sigma_xy = ((pred - mu_x) * (target - mu_y)).mean(dim=(2, 3), keepdim=True)
+    ssim = ((2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)) / (
+        (mu_x ** 2 + mu_y ** 2 + C1) * (sigma_x + sigma_y + C2) + 1e-10
+    )
+    return float(ssim.mean())
+
+
 # ──────────────────────────────────────────────────────────
 #  Dataset
 # ──────────────────────────────────────────────────────────
-class CoverLenslessSecretDataset(Dataset):
+class CoverSecretDataset(Dataset):
     """
-    Paired dataset:
-        cover image: split_cover/class_0/*.png/jpg
-        secret:      split_secret_lensless/class_0/*.npy
-        optional original secret reference: split_secret/class_0/*.png/jpg
+    Paired dataset supporting two secret modes:
 
-    Pairing is by sorted order, preserving class_0 folder layout.
-    If your filenames match exactly, sorted order should already align.
+    secret_mode='lensless':
+        cover:  split_cover/class_0/*.png/jpg
+        secret: split_secret_lensless/class_0/*.npy
+        reference original RGB secret: split_secret/class_0/*.png/jpg
+
+    secret_mode='rgb':
+        cover:  split_cover/class_0/*.png/jpg
+        secret: split_secret/class_0/*.png/jpg
+        reference original RGB secret: same as secret
     """
 
-    def __init__(self, root, split, image_size=128, return_original=True):
+    def __init__(self, root, split, image_size=128, secret_mode="lensless", return_original=True):
         self.root = Path(root)
         self.split = split
         self.image_size = image_size
+        self.secret_mode = secret_mode
         self.return_original = return_original
 
         self.cover_root = self.root / f"{split}_cover"
@@ -204,13 +252,19 @@ class CoverLenslessSecretDataset(Dataset):
         self.original_root = self.root / f"{split}_secret"
 
         self.cover_files = list_images_recursive(self.cover_root)
-        self.secret_files = list_npy_recursive(self.lensless_root)
         self.original_files = list_images_recursive(self.original_root) if self.original_root.exists() else []
+
+        if self.secret_mode == "lensless":
+            self.secret_files = list_npy_recursive(self.lensless_root)
+        elif self.secret_mode == "rgb":
+            self.secret_files = list_images_recursive(self.original_root)
+        else:
+            raise ValueError(f"Unknown secret_mode: {self.secret_mode}")
 
         if len(self.cover_files) == 0:
             raise RuntimeError(f"No cover images found in {self.cover_root}")
         if len(self.secret_files) == 0:
-            raise RuntimeError(f"No lensless .npy secrets found in {self.lensless_root}")
+            raise RuntimeError(f"No secret files found for mode={self.secret_mode}")
 
         self.n = min(len(self.cover_files), len(self.secret_files))
         if self.return_original and len(self.original_files) > 0:
@@ -228,18 +282,27 @@ class CoverLenslessSecretDataset(Dataset):
     def __len__(self):
         return self.n
 
-    def _load_lensless_npy(self, path):
+    def _load_image(self, path):
+        img = Image.open(path).convert("RGB")
+        return self.img_transform(img)
+
+    def _load_npy(self, path):
         arr = np.load(path, allow_pickle=False)
         t = torch.from_numpy(arr).float()
 
-        # Expected CHW. If HWC, convert to CHW.
-        if t.ndim == 3 and t.shape[-1] == 3 and t.shape[0] != 3:
+        # Supports HWC RGB or CHW RGB. Also supports single-channel by repeating to 3 channels.
+        if t.ndim == 2:
+            t = t.unsqueeze(0).repeat(3, 1, 1)
+        elif t.ndim == 3 and t.shape[0] == 1:
+            t = t.repeat(3, 1, 1)
+        elif t.ndim == 3 and t.shape[-1] == 1 and t.shape[0] != 1:
+            t = t.permute(2, 0, 1).repeat(3, 1, 1).contiguous()
+        elif t.ndim == 3 and t.shape[-1] == 3 and t.shape[0] != 3:
             t = t.permute(2, 0, 1).contiguous()
 
         if t.ndim != 3 or t.shape[0] != 3:
-            raise ValueError(f"Expected 3-channel lensless array, got shape {tuple(t.shape)} from {path}")
+            raise ValueError(f"Expected 1- or 3-channel npy, got shape {tuple(t.shape)} from {path}")
 
-        # Resize if needed.
         if t.shape[-2:] != (self.image_size, self.image_size):
             t = torch.nn.functional.interpolate(
                 t.unsqueeze(0),
@@ -251,16 +314,17 @@ class CoverLenslessSecretDataset(Dataset):
         return t.clamp(0, 1)
 
     def __getitem__(self, idx):
-        cover = Image.open(self.cover_files[idx]).convert("RGB")
-        cover_t = self.img_transform(cover)
+        cover_t = self._load_image(self.cover_files[idx])
 
-        secret_t = self._load_lensless_npy(self.secret_files[idx])
+        if self.secret_mode == "lensless":
+            secret_t = self._load_npy(self.secret_files[idx])
+        else:
+            secret_t = self._load_image(self.secret_files[idx])
 
         if self.return_original and len(self.original_files) > 0:
-            original = Image.open(self.original_files[idx]).convert("RGB")
-            original_t = self.img_transform(original)
+            original_t = self._load_image(self.original_files[idx])
         else:
-            original_t = torch.zeros_like(secret_t)
+            original_t = secret_t.clone()
 
         return {
             "cover": cover_t,
@@ -275,6 +339,9 @@ class CoverLenslessSecretDataset(Dataset):
 #  Output setup
 # ──────────────────────────────────────────────────────────
 def setup_outputs(opt):
+    if opt.remark == "":
+        opt.remark = f"_{opt.secret_mode}_secret"
+
     cur_time = time.strftime("%Y-%m-%d-%H_%M_%S", time.localtime())
     experiment_dir = f"{opt.hostname}_{cur_time}{opt.remark}"
     root = os.path.join(opt.outroot, experiment_dir)
@@ -287,6 +354,7 @@ def setup_outputs(opt):
         "testpics": os.path.join(root, "testPics"),
         "logs": os.path.join(root, "trainingLogs"),
         "codes": os.path.join(root, "codes"),
+        "plots": os.path.join(root, "plots"),
     }
     if not opt.debug:
         for p in paths.values():
@@ -305,17 +373,88 @@ def save_current_code(dst_dir, debug=False):
 
 
 # ──────────────────────────────────────────────────────────
+#  History / plots
+# ──────────────────────────────────────────────────────────
+class MetricHistory:
+    def __init__(self):
+        self.rows = []
+
+    def append(self, epoch, split, h_loss, r_loss, sum_loss, cover_psnr, cover_ssim, secret_psnr, secret_ssim):
+        self.rows.append({
+            "epoch": int(epoch),
+            "split": split,
+            "h_loss": float(h_loss),
+            "r_loss": float(r_loss),
+            "sum_loss": float(sum_loss),
+            "cover_psnr": float(cover_psnr),
+            "cover_ssim": float(cover_ssim),
+            "secret_psnr": float(secret_psnr),
+            "secret_ssim": float(secret_ssim),
+        })
+
+    def write_csv(self, path):
+        if not self.rows:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(self.rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(self.rows)
+
+
+def plot_metric_history(history, save_dir, secret_mode):
+    os.makedirs(save_dir, exist_ok=True)
+    csv_path = os.path.join(save_dir, f"metrics_{secret_mode}.csv")
+    png_path = os.path.join(save_dir, f"psnr_ssim_curves_{secret_mode}.png")
+    history.write_csv(csv_path)
+
+    rows = [r for r in history.rows if r["split"] == "validation"]
+    if len(rows) == 0:
+        return csv_path, None
+
+    epochs = [r["epoch"] for r in rows]
+    cover_psnr = [r["cover_psnr"] for r in rows]
+    secret_psnr = [r["secret_psnr"] for r in rows]
+    cover_ssim = [r["cover_ssim"] for r in rows]
+    secret_ssim = [r["secret_ssim"] for r in rows]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), dpi=130)
+    fig.suptitle(f"Original HidingUNet/RevealNet — {secret_mode.upper()} secret", fontsize=14, fontweight="bold")
+
+    axes[0].plot(epochs, cover_psnr, marker="o", label="Container PSNR: container vs cover")
+    axes[0].plot(epochs, secret_psnr, marker="o", label="Secret PSNR: recovered secret vs target secret")
+    axes[0].set_title("PSNR Curves")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("PSNR (dB)")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(epochs, cover_ssim, marker="o", label="Container SSIM")
+    axes[1].plot(epochs, secret_ssim, marker="o", label="Secret SSIM")
+    axes[1].set_title("SSIM Curves")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("SSIM")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig(png_path, bbox_inches="tight")
+    plt.close(fig)
+    return csv_path, png_path
+
+
+# ──────────────────────────────────────────────────────────
 #  Visualization
 # ──────────────────────────────────────────────────────────
-def save_result_pic(cover, container, secret_lensless, rev_secret, original_secret,
+def save_result_pic(cover, container, secret, rev_secret, original_secret,
                     epoch, batch_i, save_path, prefix="ResultPics"):
     """
     Saves quick tensor grid rows:
         cover
         container
         original RGB secret reference
-        lensless secret target
-        revealed lensless secret
+        target secret used for training
+        revealed/recovered secret
         abs difference
     """
     os.makedirs(save_path, exist_ok=True)
@@ -323,12 +462,12 @@ def save_result_pic(cover, container, secret_lensless, rev_secret, original_secr
     cover = tensor_to_display_grid(cover.detach().cpu())
     container = tensor_to_display_grid(container.detach().cpu())
     original_secret = tensor_to_display_grid(original_secret.detach().cpu())
-    secret_lensless = tensor_to_display_grid(secret_lensless.detach().cpu())
+    secret = tensor_to_display_grid(secret.detach().cpu())
     rev_secret = tensor_to_display_grid(rev_secret.detach().cpu())
-    diff = (rev_secret - secret_lensless).abs()
+    diff = (rev_secret - secret).abs()
 
     b = cover.size(0)
-    grid = torch.cat([cover, container, original_secret, secret_lensless, rev_secret, diff], dim=0)
+    grid = torch.cat([cover, container, original_secret, secret, rev_secret, diff], dim=0)
     out_name = os.path.join(save_path, f"{prefix}_epoch{epoch:03d}_batch{batch_i:04d}.png")
     vutils.save_image(grid, out_name, nrow=b, padding=1, normalize=False)
     return out_name
@@ -352,35 +491,36 @@ def _to_grid_img(t, auto_norm=False):
     return np.clip(a, 0, 1)
 
 
+def _metric_text_rows(cover, container, secret, rev_secret, recon_gt=None, recon_rev=None):
+    lines = []
+    lines.append(f"Container\nPSNR {batch_psnr(container, cover):.2f} dB\nSSIM {batch_ssim(container, cover):.3f}")
+    lines.append(f"Secret recovery\nPSNR {batch_psnr(rev_secret, secret):.2f} dB\nSSIM {batch_ssim(rev_secret, secret):.3f}")
+    if recon_gt is not None and recon_rev is not None:
+        lines.append(f"Recon recovery\nPSNR {batch_psnr(recon_rev, recon_gt):.2f} dB\nSSIM {batch_ssim(recon_rev, recon_gt):.3f}")
+    return "\n\n".join(lines)
+
+
 def save_val_reconstruction_grid(
     cover,
     container,
     original_secret,
-    secret_lensless,
+    secret,
     rev_secret,
     epoch,
     batch_i,
     save_path,
+    secret_mode="lensless",
     prefix="ValRecon",
     n=5,
 ):
     """
-    Qualitative validation/test grid using the same lensless reconstruction
-    module used in stego_run.py.
+    Validation/test grid with PSNR/SSIM text.
 
-    Purpose:
-      Show that the hidden/recovered secret is a lensless diffraction pattern,
-      and that direct reconstruction from this pattern is limited/degraded.
-
-    Rows:
-      Cover
-      Container
-      Original Secret RGB
-      Secret Lensless .npy
-      Recovered Lensless
+    For lensless mode, also shows reconstruction rows using lenslessConverter:
       Recon from GT Lensless
       Recon from Recovered Lensless
-      Diff(Container - Cover)
+
+    For rgb mode, reconstruction rows are skipped because the secret is already a normal RGB image.
     """
     os.makedirs(save_path, exist_ok=True)
 
@@ -389,27 +529,30 @@ def save_val_reconstruction_grid(
     cover_01 = tensor_to_display_grid(cover[:n]).detach()
     container_01 = tensor_to_display_grid(container[:n]).detach()
     original_01 = tensor_to_display_grid(original_secret[:n]).detach()
-    secret_lensless_01 = tensor_to_display_grid(secret_lensless[:n]).detach()
+    secret_01 = tensor_to_display_grid(secret[:n]).detach()
     rev_secret_01 = tensor_to_display_grid(rev_secret[:n]).detach()
     diff_01 = (container_01 - cover_01).abs()
 
-    device = secret_lensless.device
+    recon_gt = None
+    recon_rev = None
 
-    try:
-        recon_gt = lenslessConverter.partial_reconstruct_tensor_rev_V7_128(
-            secret_lensless[:n].detach().to(device)
-        ).detach().cpu().clamp(0, 1)
-    except Exception as e:
-        print(f"[WARN] GT lensless reconstruction failed: {e}")
-        recon_gt = None
+    if secret_mode == "lensless":
+        device = secret.device
+        try:
+            recon_gt = lenslessConverter.partial_reconstruct_tensor_rev_V7_128(
+                secret[:n].detach().to(device)
+            ).detach().cpu().clamp(0, 1)
+        except Exception as e:
+            print(f"[WARN] GT lensless reconstruction failed: {e}")
+            recon_gt = None
 
-    try:
-        recon_rev = lenslessConverter.partial_reconstruct_tensor_rev_V7_128(
-            rev_secret[:n].detach().to(device)
-        ).detach().cpu().clamp(0, 1)
-    except Exception as e:
-        print(f"[WARN] recovered lensless reconstruction failed: {e}")
-        recon_rev = None
+        try:
+            recon_rev = lenslessConverter.partial_reconstruct_tensor_rev_V7_128(
+                rev_secret[:n].detach().to(device)
+            ).detach().cpu().clamp(0, 1)
+        except Exception as e:
+            print(f"[WARN] recovered lensless reconstruction failed: {e}")
+            recon_rev = None
 
     rows = []
     titles = []
@@ -424,14 +567,24 @@ def save_val_reconstruction_grid(
     add_row("Cover", cover_01, False)
     add_row("Container", container_01, False)
     add_row("Original Secret RGB", original_01, False)
-    add_row("Secret Lensless (.npy)", secret_lensless_01, False)
-    add_row("Recovered Lensless", rev_secret_01, False)
+    add_row("Target Secret" if secret_mode == "rgb" else "Secret Lensless (.npy)", secret_01, False)
+    add_row("Recovered Secret" if secret_mode == "rgb" else "Recovered Lensless", rev_secret_01, False)
     add_row("Recon from GT Lensless", recon_gt, False)
     add_row("Recon from Recovered", recon_rev, False)
     add_row("Diff(Container-Cover)", diff_01, True)
 
-    fig, axes = plt.subplots(len(rows), n, figsize=(4 * n, 3 * len(rows)), dpi=120)
-    axes = np.asarray(axes).reshape(len(rows), n)
+    metric_text = _metric_text_rows(
+        cover_01,
+        container_01,
+        secret_01,
+        rev_secret_01,
+        recon_gt=recon_gt,
+        recon_rev=recon_rev,
+    )
+
+    rows_for_fig = len(rows) + 1
+    fig, axes = plt.subplots(rows_for_fig, n, figsize=(4 * n, 3 * rows_for_fig), dpi=120)
+    axes = np.asarray(axes).reshape(rows_for_fig, n)
 
     for i, (title, stack) in enumerate(zip(titles, rows)):
         for j in range(n):
@@ -452,15 +605,42 @@ def save_val_reconstruction_grid(
             fontweight="bold",
         )
 
+    # Metric row.
+    metric_row_idx = rows_for_fig - 1
+    for j in range(n):
+        axes[metric_row_idx, j].axis("off")
+        if j == 0:
+            axes[metric_row_idx, j].text(
+                0.02,
+                0.95,
+                metric_text,
+                va="top",
+                ha="left",
+                fontsize=10,
+                family="monospace",
+                bbox=dict(boxstyle="round,pad=0.35", facecolor="#ffffff", edgecolor="#cccccc"),
+            )
+    axes[metric_row_idx, 0].annotate(
+        "PSNR / SSIM",
+        xy=(0, 0.5),
+        xytext=(-38, 0),
+        xycoords="axes fraction",
+        textcoords="offset points",
+        ha="right",
+        va="center",
+        fontsize=10,
+        fontweight="bold",
+    )
+
     fig.suptitle(
-        "Validation Grid: lensless secret recovery and limited direct reconstruction",
+        f"Validation Grid — original HidingUNet/RevealNet using {secret_mode.upper()} secret",
         fontsize=14,
         fontweight="bold",
         y=0.995,
     )
     plt.tight_layout(pad=1.4, h_pad=1.0)
 
-    out_name = os.path.join(save_path, f"{prefix}_epoch{epoch:03d}_batch{batch_i:04d}.png")
+    out_name = os.path.join(save_path, f"{prefix}_{secret_mode}_epoch{epoch:03d}_batch{batch_i:04d}.png")
     plt.savefig(out_name, bbox_inches="tight")
     plt.close(fig)
     return out_name
@@ -477,7 +657,10 @@ def train_epoch(train_loader, epoch, Hnet, Rnet, criterion, optimizerH, optimize
     Hlosses = AverageMeter()
     Rlosses = AverageMeter()
     SumLosses = AverageMeter()
-    PSNRs = AverageMeter()
+    CoverPSNRs = AverageMeter()
+    CoverSSIMs = AverageMeter()
+    SecretPSNRs = AverageMeter()
+    SecretSSIMs = AverageMeter()
 
     start_time = time.time()
 
@@ -507,15 +690,19 @@ def train_epoch(train_loader, epoch, Hnet, Rnet, criterion, optimizerH, optimize
         Hlosses.update(errH.item(), bs)
         Rlosses.update(errR.item(), bs)
         SumLosses.update(err_sum.item(), bs)
-        PSNRs.update(batch_psnr(rev_secret_img, secret_img), bs)
+        CoverPSNRs.update(batch_psnr(container_img, cover_img), bs)
+        CoverSSIMs.update(batch_ssim(container_img, cover_img), bs)
+        SecretPSNRs.update(batch_psnr(rev_secret_img, secret_img), bs)
+        SecretSSIMs.update(batch_ssim(rev_secret_img, secret_img), bs)
 
         if i % opt.logFrequency == 0:
             elapsed = time.time() - start_time
             log = (
                 f"[{epoch}/{opt.niter}][{i}/{len(train_loader)}] "
                 f"Loss_H: {Hlosses.val:.6f} Loss_R: {Rlosses.val:.6f} "
-                f"Loss_sum: {SumLosses.val:.6f} SecretPSNR: {PSNRs.val:.2f} dB "
-                f"time: {elapsed:.2f}s"
+                f"Loss_sum: {SumLosses.val:.6f} "
+                f"CovPSNR: {CoverPSNRs.val:.2f} SecPSNR: {SecretPSNRs.val:.2f} "
+                f"SecSSIM: {SecretSSIMs.val:.3f} time: {elapsed:.2f}s"
             )
             print_log(log, log_path, debug=opt.debug)
 
@@ -529,23 +716,35 @@ def train_epoch(train_loader, epoch, Hnet, Rnet, criterion, optimizerH, optimize
                 epoch,
                 i,
                 trainpics,
-                prefix="Train",
+                prefix=f"Train_{opt.secret_mode}",
             )
 
     if writer is not None:
         writer.add_scalar("train/H_loss", Hlosses.avg, epoch)
         writer.add_scalar("train/R_loss", Rlosses.avg, epoch)
         writer.add_scalar("train/sum_loss", SumLosses.avg, epoch)
-        writer.add_scalar("train/secret_psnr", PSNRs.avg, epoch)
+        writer.add_scalar("train/cover_psnr", CoverPSNRs.avg, epoch)
+        writer.add_scalar("train/cover_ssim", CoverSSIMs.avg, epoch)
+        writer.add_scalar("train/secret_psnr", SecretPSNRs.avg, epoch)
+        writer.add_scalar("train/secret_ssim", SecretSSIMs.avg, epoch)
 
     epoch_log = (
         f"Epoch {epoch:03d} | "
-        f"Hloss={Hlosses.avg:.6f} Rloss={Rlosses.avg:.6f} "
-        f"Sum={SumLosses.avg:.6f} SecretPSNR={PSNRs.avg:.2f} dB"
+        f"Hloss={Hlosses.avg:.6f} Rloss={Rlosses.avg:.6f} Sum={SumLosses.avg:.6f} | "
+        f"CoverPSNR={CoverPSNRs.avg:.2f} CoverSSIM={CoverSSIMs.avg:.3f} | "
+        f"SecretPSNR={SecretPSNRs.avg:.2f} SecretSSIM={SecretSSIMs.avg:.3f}"
     )
     print_log(epoch_log, log_path, debug=opt.debug)
 
-    return Hlosses.avg, Rlosses.avg, SumLosses.avg, PSNRs.avg
+    return {
+        "h_loss": Hlosses.avg,
+        "r_loss": Rlosses.avg,
+        "sum_loss": SumLosses.avg,
+        "cover_psnr": CoverPSNRs.avg,
+        "cover_ssim": CoverSSIMs.avg,
+        "secret_psnr": SecretPSNRs.avg,
+        "secret_ssim": SecretSSIMs.avg,
+    }
 
 
 @torch.no_grad()
@@ -556,7 +755,10 @@ def eval_epoch(kind, loader, epoch, Hnet, Rnet, criterion, opt, device, writer, 
     Hlosses = AverageMeter()
     Rlosses = AverageMeter()
     SumLosses = AverageMeter()
-    PSNRs = AverageMeter()
+    CoverPSNRs = AverageMeter()
+    CoverSSIMs = AverageMeter()
+    SecretPSNRs = AverageMeter()
+    SecretSSIMs = AverageMeter()
 
     for i, batch in enumerate(loader):
         cover_img = batch["cover"].to(device, non_blocking=True)
@@ -575,7 +777,10 @@ def eval_epoch(kind, loader, epoch, Hnet, Rnet, criterion, opt, device, writer, 
         Hlosses.update(errH.item(), bs)
         Rlosses.update(errR.item(), bs)
         SumLosses.update(err_sum.item(), bs)
-        PSNRs.update(batch_psnr(rev_secret_img, secret_img), bs)
+        CoverPSNRs.update(batch_psnr(container_img, cover_img), bs)
+        CoverSSIMs.update(batch_ssim(container_img, cover_img), bs)
+        SecretPSNRs.update(batch_psnr(rev_secret_img, secret_img), bs)
+        SecretSSIMs.update(batch_ssim(rev_secret_img, secret_img), bs)
 
         # Always save first batch for validation/test.
         if i == 0:
@@ -588,19 +793,20 @@ def eval_epoch(kind, loader, epoch, Hnet, Rnet, criterion, opt, device, writer, 
                 epoch,
                 i,
                 outpics,
-                prefix=kind,
+                prefix=f"{kind}_{opt.secret_mode}",
             )
 
             save_val_reconstruction_grid(
                 cover=cover_img,
                 container=container_img,
                 original_secret=original_secret,
-                secret_lensless=secret_img,
+                secret=secret_img,
                 rev_secret=rev_secret_img,
                 epoch=epoch,
                 batch_i=i,
                 save_path=outpics,
-                prefix=f"{kind}_ReconGrid",
+                secret_mode=opt.secret_mode,
+                prefix=f"{kind}_MetricGrid",
                 n=min(5, cover_img.size(0)),
             )
 
@@ -608,16 +814,28 @@ def eval_epoch(kind, loader, epoch, Hnet, Rnet, criterion, opt, device, writer, 
         writer.add_scalar(f"{kind}/H_loss", Hlosses.avg, epoch)
         writer.add_scalar(f"{kind}/R_loss", Rlosses.avg, epoch)
         writer.add_scalar(f"{kind}/sum_loss", SumLosses.avg, epoch)
-        writer.add_scalar(f"{kind}/secret_psnr", PSNRs.avg, epoch)
+        writer.add_scalar(f"{kind}/cover_psnr", CoverPSNRs.avg, epoch)
+        writer.add_scalar(f"{kind}/cover_ssim", CoverSSIMs.avg, epoch)
+        writer.add_scalar(f"{kind}/secret_psnr", SecretPSNRs.avg, epoch)
+        writer.add_scalar(f"{kind}/secret_ssim", SecretSSIMs.avg, epoch)
 
     log = (
         f"[{kind}] Epoch {epoch:03d} | "
-        f"Hloss={Hlosses.avg:.6f} Rloss={Rlosses.avg:.6f} "
-        f"Sum={SumLosses.avg:.6f} SecretPSNR={PSNRs.avg:.2f} dB"
+        f"Hloss={Hlosses.avg:.6f} Rloss={Rlosses.avg:.6f} Sum={SumLosses.avg:.6f} | "
+        f"CoverPSNR={CoverPSNRs.avg:.2f} CoverSSIM={CoverSSIMs.avg:.3f} | "
+        f"SecretPSNR={SecretPSNRs.avg:.2f} SecretSSIM={SecretSSIMs.avg:.3f}"
     )
     print_log(log, log_path, debug=opt.debug)
 
-    return Hlosses.avg, Rlosses.avg, SumLosses.avg, PSNRs.avg
+    return {
+        "h_loss": Hlosses.avg,
+        "r_loss": Rlosses.avg,
+        "sum_loss": SumLosses.avg,
+        "cover_psnr": CoverPSNRs.avg,
+        "cover_ssim": CoverSSIMs.avg,
+        "secret_psnr": SecretPSNRs.avg,
+        "secret_ssim": SecretSSIMs.avg,
+    }
 
 
 # ──────────────────────────────────────────────────────────
@@ -629,20 +847,26 @@ def main():
 
     device = torch.device("cuda:0" if torch.cuda.is_available() and opt.cuda else "cpu")
     print(f"Using device: {device}")
+    print(f"Secret mode: {opt.secret_mode}")
+    print(f"SSIM backend: {SSIM_BACKEND}")
 
     paths = setup_outputs(opt)
-    log_path = os.path.join(paths["logs"], f"lensless_npy_bs{opt.batchSize}_log.txt")
+    log_path = os.path.join(paths["logs"], f"{opt.secret_mode}_bs{opt.batchSize}_log.txt")
     save_current_code(paths["codes"], debug=opt.debug)
 
     writer = SummaryWriter(log_dir=os.path.join(paths["root"], "runs")) if not opt.debug else None
+    history = MetricHistory()
 
     print_log(str(opt), log_path, debug=opt.debug)
     print_log(f"Dataset root: {opt.data}", log_path, debug=opt.debug)
 
     # Datasets/loaders
-    train_dataset = CoverLenslessSecretDataset(opt.data, "train", image_size=opt.imageSize, return_original=True)
-    val_dataset = CoverLenslessSecretDataset(opt.data, "validation", image_size=opt.imageSize, return_original=True)
-    test_dataset = CoverLenslessSecretDataset(opt.data, "test", image_size=opt.imageSize, return_original=True)
+    train_dataset = CoverSecretDataset(opt.data, "train", image_size=opt.imageSize,
+                                       secret_mode=opt.secret_mode, return_original=True)
+    val_dataset = CoverSecretDataset(opt.data, "validation", image_size=opt.imageSize,
+                                     secret_mode=opt.secret_mode, return_original=True)
+    test_dataset = CoverSecretDataset(opt.data, "test", image_size=opt.imageSize,
+                                      secret_mode=opt.secret_mode, return_original=True)
 
     train_loader = DataLoader(
         train_dataset,
@@ -700,7 +924,12 @@ def main():
     schedulerR = ReduceLROnPlateau(optimizerR, mode="min", factor=0.2, patience=8, verbose=True)
 
     if opt.test_only:
-        eval_epoch("test", test_loader, 0, Hnet, Rnet, criterion, opt, device, writer, log_path, paths["testpics"])
+        test_metrics = eval_epoch("test", test_loader, 0, Hnet, Rnet, criterion, opt, device, writer, log_path, paths["testpics"])
+        history.append(0, "test", **test_metrics)
+        csv_path, png_path = plot_metric_history(history, paths["plots"], opt.secret_mode)
+        print_log(f"Metrics CSV: {csv_path}", log_path, debug=opt.debug)
+        if png_path:
+            print_log(f"Metrics plot: {png_path}", log_path, debug=opt.debug)
         if writer is not None:
             writer.close()
         return
@@ -709,7 +938,7 @@ def main():
 
     print_log("Training is beginning...", log_path, debug=opt.debug)
     for epoch in range(opt.niter):
-        train_epoch(
+        train_metrics = train_epoch(
             train_loader,
             epoch,
             Hnet,
@@ -723,8 +952,9 @@ def main():
             log_path,
             paths["trainpics"],
         )
+        history.append(epoch, "train", **train_metrics)
 
-        val_hloss, val_rloss, val_sumloss, val_psnr = eval_epoch(
+        val_metrics = eval_epoch(
             "validation",
             val_loader,
             epoch,
@@ -737,19 +967,35 @@ def main():
             log_path,
             paths["valpics"],
         )
+        history.append(epoch, "validation", **val_metrics)
 
-        schedulerH.step(val_sumloss)
-        schedulerR.step(val_rloss)
+        schedulerH.step(val_metrics["sum_loss"])
+        schedulerR.step(val_metrics["r_loss"])
 
-        if val_sumloss < smallest_loss:
-            smallest_loss = val_sumloss
-            h_path = os.path.join(paths["ckpt"], f"netH_epoch_{epoch:03d}_sumloss={val_sumloss:.6f}_Hloss={val_hloss:.6f}.pth")
-            r_path = os.path.join(paths["ckpt"], f"netR_epoch_{epoch:03d}_sumloss={val_sumloss:.6f}_Rloss={val_rloss:.6f}.pth")
+        if val_metrics["sum_loss"] < smallest_loss:
+            smallest_loss = val_metrics["sum_loss"]
+            h_path = os.path.join(
+                paths["ckpt"],
+                f"netH_{opt.secret_mode}_epoch_{epoch:03d}_sumloss={val_metrics['sum_loss']:.6f}_Hloss={val_metrics['h_loss']:.6f}.pth",
+            )
+            r_path = os.path.join(
+                paths["ckpt"],
+                f"netR_{opt.secret_mode}_epoch_{epoch:03d}_sumloss={val_metrics['sum_loss']:.6f}_Rloss={val_metrics['r_loss']:.6f}.pth",
+            )
             torch.save(Hnet.state_dict(), h_path)
             torch.save(Rnet.state_dict(), r_path)
             print_log(f"Saved best checkpoints:\n  {h_path}\n  {r_path}", log_path, debug=opt.debug)
 
-    eval_epoch("test", test_loader, opt.niter, Hnet, Rnet, criterion, opt, device, writer, log_path, paths["testpics"])
+        csv_path, png_path = plot_metric_history(history, paths["plots"], opt.secret_mode)
+        if png_path:
+            print_log(f"Curves saved: {png_path}", log_path, console=((epoch + 1) % 10 == 0), debug=opt.debug)
+
+    test_metrics = eval_epoch("test", test_loader, opt.niter, Hnet, Rnet, criterion, opt, device, writer, log_path, paths["testpics"])
+    history.append(opt.niter, "test", **test_metrics)
+    csv_path, png_path = plot_metric_history(history, paths["plots"], opt.secret_mode)
+    print_log(f"Final metrics CSV: {csv_path}", log_path, debug=opt.debug)
+    if png_path:
+        print_log(f"Final metrics plot: {png_path}", log_path, debug=opt.debug)
 
     if writer is not None:
         writer.close()
