@@ -86,7 +86,7 @@ except Exception:
 # ──────────────────────────────────────────────────────────
 #  Defaults
 # ──────────────────────────────────────────────────────────
-DEFAULT_DATA_DIR = "/scratch/p522p287/DATA/STEN_DATA_LENSLESS/DIV2K_STEN/"
+DEFAULT_DATA_DIR = "/scratch/p522p287/DATA/STEN_DATA_LENSLESS_TWO/DIV2K_STEN/"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 

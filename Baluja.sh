@@ -6,5 +6,5 @@
 #SBATCH -o slurm-%j.out
 
 #SBATCH -p gpu
-#SBATCH --gres="gpu:v100:1"
+#SBATCH --gres="gpu:a100:1"
 python3 updatedLenslessScript.py
